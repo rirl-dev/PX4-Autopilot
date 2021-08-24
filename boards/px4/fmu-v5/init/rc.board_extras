@@ -1,0 +1,15 @@
+#!/bin/sh
+#
+#------------------------------------------------------------------------------
+
+px4io stop
+
+px4io checkcrc /etc/extras/px4_io-v2_default.bin
+px4io update /etc/extras/px4_io-v2_default.bin
+px4io checkcrc /etc/extras/px4_io-v2_default.bin
+
+px4io start
+px4io debug 5
+mixer load /dev/pwm_output0 /etc/mixers/quad_x.main.mix
+
+pwm info
