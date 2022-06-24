@@ -62,6 +62,7 @@ px4_add_module(
 		hysteresis
 		PreFlightCheck
 		ArmAuthorization
+		ArmStateMachine
 		HealthFlags
 		sensor_calibration
 		world_magnetic_model

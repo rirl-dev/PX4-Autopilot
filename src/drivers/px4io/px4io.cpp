@@ -1,6 +1,6 @@
 /****************************************************************************
  *
- *   Copyright (c) 2012-2021 PX4 Development Team. All rights reserved.
+ *   Copyright (c) 2012-2022 PX4 Development Team. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -74,6 +74,7 @@
 #include <uORB/topics/input_rc.h>
 #include <uORB/topics/vehicle_command.h>
 #include <uORB/topics/vehicle_command_ack.h>
+#include <uORB/topics/vehicle_status.h>
 #include <uORB/topics/px4io_status.h>
 #include <uORB/topics/parameter_update.h>
 
@@ -196,11 +197,14 @@ private:
 	uint16_t		_last_written_arming_c{0};	///< the last written arming state reg
 
 	uORB::Subscription	_t_actuator_armed{ORB_ID(actuator_armed)};		///< system armed control topic
-	uORB::Subscription	_t_vehicle_command{ORB_ID(vehicle_command)};		///< vehicle command topic
+	uORB::Subscription	_t_vehicle_command{ORB_ID(vehicle_command)};	///< vehicle command topic
+	uORB::Subscription	_t_vehicle_status{ORB_ID(vehicle_status)};		///< vehicle status topic
 
 	uORB::SubscriptionInterval _parameter_update_sub{ORB_ID(parameter_update), 1_s};
 
 	hrt_abstime             _last_status_publish{0};
+
+	uint16_t 		_rc_valid_update_count{0};
 
 	bool			_param_update_force{true};	///< force a parameter update
 	bool			_timer_rates_configured{false};
@@ -377,8 +381,6 @@ PX4IO::~PX4IO()
 bool PX4IO::updateOutputs(bool stop_motors, uint16_t outputs[MAX_ACTUATORS],
 			  unsigned num_outputs, unsigned num_control_groups_updated)
 {
-	SmartLock lock_guard(_lock);
-
 	if (!_test_fmu_fail) {
 		/* output to the servos */
 		io_reg_set(PX4IO_PAGE_DIRECT_PWM, 0, outputs, num_outputs);
@@ -389,6 +391,8 @@ bool PX4IO::updateOutputs(bool stop_motors, uint16_t outputs[MAX_ACTUATORS],
 
 int PX4IO::init()
 {
+	SmartLock lock_guard(_lock);
+
 	/* do regular cdev init */
 	int ret = CDev::init();
 
@@ -441,14 +445,13 @@ int PX4IO::init()
 		// the startup script to be able to load a new IO
 		// firmware
 
-		// If IO has already safety off it won't accept going into bootloader mode,
-		// therefore we need to set safety on first.
-		io_reg_set(PX4IO_PAGE_SETUP, PX4IO_P_SETUP_FORCE_SAFETY_ON, PX4IO_FORCE_SAFETY_MAGIC);
-
 		// Now the reboot into bootloader mode should succeed.
 		io_reg_set(PX4IO_PAGE_SETUP, PX4IO_P_SETUP_REBOOT_BL, PX4IO_REBOOT_BL_MAGIC);
 		return -1;
 	}
+
+	/* Set safety_off to false when FMU boot*/
+	io_reg_set(PX4IO_PAGE_SETUP, PX4IO_P_SETUP_SAFETY_OFF, 0);
 
 	if (_max_rc_input > input_rc_s::RC_INPUT_MAX_CHANNELS) {
 		_max_rc_input = input_rc_s::RC_INPUT_MAX_CHANNELS;
@@ -472,14 +475,6 @@ int PX4IO::init()
 		events::send(events::ID("px4io_io_rc_config_upload_failed"), events::Log::Critical,
 			     "IO RC config upload failed, aborting initialization");
 		return ret;
-	}
-
-	/* set safety to off if circuit breaker enabled */
-	if (circuit_breaker_enabled("CBRK_IO_SAFETY", CBRK_IO_SAFETY_KEY)) {
-		io_reg_set(PX4IO_PAGE_SETUP, PX4IO_P_SETUP_FORCE_SAFETY_OFF, PX4IO_FORCE_SAFETY_MAGIC);
-
-	} else {
-		io_reg_set(PX4IO_PAGE_SETUP, PX4IO_P_SETUP_FORCE_SAFETY_ON, PX4IO_FORCE_SAFETY_MAGIC);
 	}
 
 	/* try to claim the generic PWM output device node as well - it's OK if we fail at this */
@@ -531,6 +526,8 @@ void PX4IO::Run()
 		return;
 	}
 
+	SmartLock lock_guard(_lock);
+
 	perf_begin(_cycle_perf);
 	perf_count(_interval_perf);
 
@@ -543,8 +540,6 @@ void PX4IO::Run()
 	if (_param_sys_hitl.get() <= 0) {
 		_mixing_output.update();
 	}
-
-	SmartLock lock_guard(_lock);
 
 	if (hrt_elapsed_time(&_poll_last) >= 20_ms) {
 		/* run at 50 */
@@ -618,11 +613,6 @@ void PX4IO::Run()
 			ModuleParams::updateParams();
 
 			update_params();
-
-			/* Check if the IO safety circuit breaker has been updated */
-			bool circuit_breaker_io_safety_enabled = circuit_breaker_enabled("CBRK_IO_SAFETY", CBRK_IO_SAFETY_KEY);
-			/* Bypass IO safety switch logic by setting FORCE_SAFETY_OFF */
-			io_reg_set(PX4IO_PAGE_SETUP, PX4IO_P_SETUP_FORCE_SAFETY_OFF, circuit_breaker_io_safety_enabled);
 
 			/* Check if the flight termination circuit breaker has been updated */
 			bool disable_flighttermination = circuit_breaker_enabled("CBRK_FLIGHTTERM", CBRK_FLIGHTTERM_KEY);
@@ -813,6 +803,14 @@ void PX4IO::update_params()
 						int32_t pwm_fail_new = _mixing_output.failsafeValue(i);
 						param_set(param_find(str), &pwm_fail_new);
 					}
+
+				} else {
+					if (pwm_default_channel_mask & 1 << i) {
+						_mixing_output.failsafeValue(i) = PWM_MOTOR_OFF;
+
+					} else {
+						_mixing_output.failsafeValue(i) = PWM_SERVO_STOP;
+					}
 				}
 			}
 		}
@@ -972,15 +970,12 @@ int PX4IO::io_handle_status(uint16_t status)
 	 */
 
 	/* check for IO reset - force it back to armed if necessary */
-	if (_status & PX4IO_P_STATUS_FLAGS_SAFETY_OFF && !(status & PX4IO_P_STATUS_FLAGS_SAFETY_OFF)
-	    && !(status & PX4IO_P_STATUS_FLAGS_ARM_SYNC)) {
+	if (!(status & PX4IO_P_STATUS_FLAGS_ARM_SYNC)) {
 		/* set the arming flag */
-		ret = io_reg_modify(PX4IO_PAGE_STATUS, PX4IO_P_STATUS_FLAGS, 0,
-				    PX4IO_P_STATUS_FLAGS_SAFETY_OFF | PX4IO_P_STATUS_FLAGS_ARM_SYNC);
+		ret = io_reg_modify(PX4IO_PAGE_STATUS, PX4IO_P_STATUS_FLAGS, 0, PX4IO_P_STATUS_FLAGS_ARM_SYNC);
 
 		/* set new status */
 		_status = status;
-		_status &= PX4IO_P_STATUS_FLAGS_SAFETY_OFF;
 
 	} else if (!(_status & PX4IO_P_STATUS_FLAGS_ARM_SYNC)) {
 
@@ -997,18 +992,26 @@ int PX4IO::io_handle_status(uint16_t status)
 	}
 
 	/**
-	 * Get and handle the safety status
+	 * Get and handle the safety button status
 	 */
-	const bool safety_off = status & PX4IO_P_STATUS_FLAGS_SAFETY_OFF;
+	const bool safety_button_pressed = status & PX4IO_P_STATUS_FLAGS_SAFETY_BUTTON_EVENT;
 
-	/* px4io board will change safety_off from false to true and stay like that until the vehicle is rebooted
-	 * where safety will change back to false. Here we are triggering the safety button event once.
-	 * TODO: change px4io firmware to act on the event. This will enable the "force safety on disarming" feature. */
-	if (_previous_safety_off != safety_off) {
+	if (safety_button_pressed) {
+		io_reg_set(PX4IO_PAGE_SETUP, PX4IO_P_SETUP_SAFETY_BUTTON_ACK, 0);
 		_button_publisher.safetyButtonTriggerEvent();
 	}
 
-	_previous_safety_off = safety_off;
+	/**
+	 * Inform PX4IO board about safety_off state for LED control
+	 */
+	vehicle_status_s vehicle_status;
+
+	if (_t_vehicle_status.update(&vehicle_status)) {
+		if (_previous_safety_off != vehicle_status.safety_off) {
+			io_reg_set(PX4IO_PAGE_SETUP, PX4IO_P_SETUP_SAFETY_OFF, vehicle_status.safety_off);
+			_previous_safety_off = vehicle_status.safety_off;
+		}
+	}
 
 	return ret;
 }
@@ -1031,37 +1034,17 @@ int PX4IO::dsm_bind_ioctl(int dsmMode)
 		return -EINVAL;
 	}
 
-	// Check if safety was off
-	bool safety_off = (_status & PX4IO_P_STATUS_FLAGS_SAFETY_OFF);
-	int ret = -1;
-
-	// Put safety on
-	if (safety_off) {
-		// re-enable safety
-		ret = io_reg_modify(PX4IO_PAGE_STATUS, PX4IO_P_STATUS_FLAGS, PX4IO_P_STATUS_FLAGS_SAFETY_OFF, 0);
-
-		// set new status
-		_status &= ~(PX4IO_P_STATUS_FLAGS_SAFETY_OFF);
-	}
-
 	PX4_INFO("Binding DSM%s RX", (dsmMode == DSM2_BIND_PULSES) ? "2" : ((dsmMode == DSMX_BIND_PULSES) ? "-X" : "-X8"));
 
-	io_reg_set(PX4IO_PAGE_SETUP, PX4IO_P_SETUP_DSM, dsm_bind_power_down);
+	int ret = OK;
+	ret |= io_reg_set(PX4IO_PAGE_SETUP, PX4IO_P_SETUP_DSM, dsm_bind_power_down);
 	px4_usleep(500000);
-	io_reg_set(PX4IO_PAGE_SETUP, PX4IO_P_SETUP_DSM, dsm_bind_set_rx_out);
-	io_reg_set(PX4IO_PAGE_SETUP, PX4IO_P_SETUP_DSM, dsm_bind_power_up);
+	ret |= io_reg_set(PX4IO_PAGE_SETUP, PX4IO_P_SETUP_DSM, dsm_bind_set_rx_out);
+	ret |= io_reg_set(PX4IO_PAGE_SETUP, PX4IO_P_SETUP_DSM, dsm_bind_power_up);
 	px4_usleep(72000);
-	io_reg_set(PX4IO_PAGE_SETUP, PX4IO_P_SETUP_DSM, dsm_bind_send_pulses | (dsmMode << 4));
+	ret |= io_reg_set(PX4IO_PAGE_SETUP, PX4IO_P_SETUP_DSM, dsm_bind_send_pulses | (dsmMode << 4));
 	px4_usleep(50000);
-	io_reg_set(PX4IO_PAGE_SETUP, PX4IO_P_SETUP_DSM, dsm_bind_reinit_uart);
-	ret = OK;
-
-	// Put safety back off
-	if (safety_off) {
-		ret = io_reg_modify(PX4IO_PAGE_STATUS, PX4IO_P_STATUS_FLAGS, 0,
-				    PX4IO_P_STATUS_FLAGS_SAFETY_OFF);
-		_status |= PX4IO_P_STATUS_FLAGS_SAFETY_OFF;
-	}
+	ret |= io_reg_set(PX4IO_PAGE_SETUP, PX4IO_P_SETUP_DSM, dsm_bind_reinit_uart);
 
 	if (ret != OK) {
 		PX4_INFO("Binding DSM failed");
@@ -1131,7 +1114,7 @@ int PX4IO::io_get_status()
 		status.status_arm_sync        = STATUS_FLAGS & PX4IO_P_STATUS_FLAGS_ARM_SYNC;
 		status.status_init_ok         = STATUS_FLAGS & PX4IO_P_STATUS_FLAGS_INIT_OK;
 		status.status_failsafe        = STATUS_FLAGS & PX4IO_P_STATUS_FLAGS_FAILSAFE;
-		status.status_safety_off      = STATUS_FLAGS & PX4IO_P_STATUS_FLAGS_SAFETY_OFF;
+		status.status_safety_button_event = STATUS_FLAGS & PX4IO_P_STATUS_FLAGS_SAFETY_BUTTON_EVENT;
 
 		// PX4IO_P_STATUS_ALARMS
 		status.alarm_rc_lost       = STATUS_ALARMS & PX4IO_P_STATUS_ALARMS_RC_LOST;
@@ -1198,6 +1181,14 @@ int PX4IO::io_get_status()
 
 int PX4IO::io_publish_raw_rc()
 {
+	const uint16_t rc_valid_update_count = io_reg_get(PX4IO_PAGE_RAW_RC_INPUT, PX4IO_P_RAW_FRAME_COUNT);
+	const bool rc_updated = (rc_valid_update_count != _rc_valid_update_count);
+	_rc_valid_update_count = rc_valid_update_count;
+
+	if (!rc_updated) {
+		return 0;
+	}
+
 	input_rc_s input_rc{};
 	input_rc.timestamp_last_signal = hrt_absolute_time();
 
@@ -1306,8 +1297,7 @@ int PX4IO::io_publish_raw_rc()
 		input_rc.input_source = input_rc_s::RC_INPUT_SOURCE_PX4IO_ST24;
 	}
 
-	if ((input_rc.channel_count > 0) && !input_rc.rc_lost && !input_rc.rc_failsafe
-	    && (input_rc.input_source != input_rc_s::RC_INPUT_SOURCE_UNKNOWN)) {
+	if (input_rc.input_source != input_rc_s::RC_INPUT_SOURCE_UNKNOWN) {
 
 		_to_input_rc.publish(input_rc);
 	}
@@ -1635,18 +1625,6 @@ int PX4IO::ioctl(file *filep, int cmd, unsigned long arg)
 		*(unsigned *)arg = _max_actuators;
 		break;
 
-	case PWM_SERVO_SET_FORCE_SAFETY_OFF:
-		PX4_DEBUG("PWM_SERVO_SET_FORCE_SAFETY_OFF");
-		/* force safety swith off */
-		ret = io_reg_set(PX4IO_PAGE_SETUP, PX4IO_P_SETUP_FORCE_SAFETY_OFF, PX4IO_FORCE_SAFETY_MAGIC);
-		break;
-
-	case PWM_SERVO_SET_FORCE_SAFETY_ON:
-		PX4_DEBUG("PWM_SERVO_SET_FORCE_SAFETY_ON");
-		/* force safety switch on */
-		ret = io_reg_set(PX4IO_PAGE_SETUP, PX4IO_P_SETUP_FORCE_SAFETY_ON, PX4IO_FORCE_SAFETY_MAGIC);
-		break;
-
 	case DSM_BIND_START:
 		/* bind a DSM receiver */
 		ret = dsm_bind_ioctl(arg);
@@ -1689,7 +1667,7 @@ int PX4IO::ioctl(file *filep, int cmd, unsigned long arg)
 
 	case MIXERIOCRESET:
 		PX4_DEBUG("MIXERIOCRESET");
-		_mixing_output.resetMixerThreadSafe();
+		_mixing_output.resetMixer();
 		break;
 
 	case MIXERIOCLOADBUF: {
@@ -1697,7 +1675,7 @@ int PX4IO::ioctl(file *filep, int cmd, unsigned long arg)
 
 			const char *buf = (const char *)arg;
 			unsigned buflen = strlen(buf);
-			ret = _mixing_output.loadMixerThreadSafe(buf, buflen);
+			ret = _mixing_output.loadMixer(buf, buflen);
 
 			break;
 		}
@@ -1716,15 +1694,10 @@ int PX4IO::ioctl(file *filep, int cmd, unsigned long arg)
 
 		}
 
-		// re-enable safety
-		ret = io_reg_set(PX4IO_PAGE_SETUP, PX4IO_P_SETUP_FORCE_SAFETY_ON, PX4IO_FORCE_SAFETY_MAGIC);
-
-		if (ret != PX4_OK) {
-			PX4_WARN("IO refused to re-enable safety");
-		}
-
-		// set new status
-		_status &= ~(PX4IO_P_STATUS_FLAGS_SAFETY_OFF);
+		/* For Legacy PX4IO Firmware only:
+		 * If IO has already safety off it won't accept going into bootloader mode,
+		 * therefore we need to set safety on first. */
+		io_reg_set(PX4IO_PAGE_SETUP, 14, 22027);
 
 		/* reboot into bootloader - arg must be PX4IO_REBOOT_BL_MAGIC */
 		usleep(1);
@@ -2049,29 +2022,6 @@ int PX4IO::custom_command(int argc, char *argv[])
 		return 1;
 	}
 
-
-	if (!strcmp(verb, "safety_off")) {
-		int ret = get_instance()->ioctl(NULL, PWM_SERVO_SET_FORCE_SAFETY_OFF, 0);
-
-		if (ret != OK) {
-			PX4_ERR("failed to disable safety (%i)", ret);
-			return 1;
-		}
-
-		return 0;
-	}
-
-	if (!strcmp(verb, "safety_on")) {
-		int ret = get_instance()->ioctl(NULL, PWM_SERVO_SET_FORCE_SAFETY_ON, 0);
-
-		if (ret != OK) {
-			PX4_ERR("failed to enable safety (%i)", ret);
-			return 1;
-		}
-
-		return 0;
-	}
-
 	if (!strcmp(verb, "debug")) {
 		if (argc <= 1) {
 			PX4_ERR("usage: px4io debug LEVEL");
@@ -2153,8 +2103,6 @@ Output driver communicating with the IO co-processor.
 	PRINT_MODULE_USAGE_ARG("<filename>", "Firmware file", false);
 	PRINT_MODULE_USAGE_COMMAND_DESCR("update", "Update IO firmware");
 	PRINT_MODULE_USAGE_ARG("<filename>", "Firmware file", true);
-	PRINT_MODULE_USAGE_COMMAND_DESCR("safety_off", "Turn off safety (force)");
-	PRINT_MODULE_USAGE_COMMAND_DESCR("safety_on", "Turn on safety (force)");
 	PRINT_MODULE_USAGE_COMMAND_DESCR("debug", "set IO debug level");
 	PRINT_MODULE_USAGE_ARG("<debug_level>", "0=disabled, 9=max verbosity", false);
 	PRINT_MODULE_USAGE_COMMAND_DESCR("bind", "DSM bind");

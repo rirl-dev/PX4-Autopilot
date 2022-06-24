@@ -72,7 +72,7 @@ EKF2::EKF2(bool multi_mode, const px4::wq_config_t &config, bool replay_mode):
 	_param_ekf2_acc_b_noise(_params->accel_bias_p_noise),
 	_param_ekf2_mag_e_noise(_params->mage_p_noise),
 	_param_ekf2_mag_b_noise(_params->magb_p_noise),
-	_param_ekf2_wind_noise(_params->wind_vel_p_noise),
+	_param_ekf2_wind_nsd(_params->wind_vel_nsd),
 	_param_ekf2_terr_noise(_params->terrain_p_noise),
 	_param_ekf2_terr_grad(_params->terrain_gradient),
 	_param_ekf2_gps_v_noise(_params->gps_vel_noise),
@@ -119,6 +119,7 @@ EKF2::EKF2(bool multi_mode, const px4::wq_config_t &config, bool replay_mode):
 	_param_ekf2_rng_a_hmax(_params->max_hagl_for_range_aid),
 	_param_ekf2_rng_a_igate(_params->range_aid_innov_gate),
 	_param_ekf2_rng_qlty_t(_params->range_valid_quality_s),
+	_param_ekf2_rng_k_gate(_params->range_kin_consistency_gate),
 	_param_ekf2_evv_gate(_params->ev_vel_innov_gate),
 	_param_ekf2_evp_gate(_params->ev_pos_innov_gate),
 	_param_ekf2_of_n_min(_params->flow_noise),
@@ -307,7 +308,7 @@ void EKF2::Run()
 		}
 
 		// if using mag ensure sensor interval minimum is sufficient to accommodate system averaged mag output
-		if (_params->mag_fusion_type != MAG_FUSE_TYPE_NONE) {
+		if (_params->mag_fusion_type != MagFuseType::NONE) {
 			float sens_mag_rate = 0.f;
 
 			if (param_get(param_find("SENS_MAG_RATE"), &sens_mag_rate) == PX4_OK) {
@@ -342,18 +343,20 @@ void EKF2::Run()
 
 		if (_vehicle_command_sub.update(&vehicle_command)) {
 			if (vehicle_command.command == vehicle_command_s::VEHICLE_CMD_SET_GPS_GLOBAL_ORIGIN) {
-				if (!_ekf.control_status_flags().in_air) {
+				double latitude = vehicle_command.param5;
+				double longitude = vehicle_command.param6;
+				float altitude = vehicle_command.param7;
 
-					uint64_t origin_time {};
-					double latitude = vehicle_command.param5;
-					double longitude = vehicle_command.param6;
-					float altitude = vehicle_command.param7;
-
-					_ekf.setEkfGlobalOrigin(latitude, longitude, altitude);
-
+				if (_ekf.setEkfGlobalOrigin(latitude, longitude, altitude)) {
 					// Validate the ekf origin status.
+					uint64_t origin_time {};
 					_ekf.getEkfGlobalOrigin(origin_time, latitude, longitude, altitude);
-					PX4_INFO("New NED origin (LLA): %3.10f, %3.10f, %4.3f\n", latitude, longitude, static_cast<double>(altitude));
+					PX4_INFO("%d - New NED origin (LLA): %3.10f, %3.10f, %4.3f\n",
+						 _instance, latitude, longitude, static_cast<double>(altitude));
+
+				} else {
+					PX4_ERR("%d - Failed to set new NED origin (LLA): %3.10f, %3.10f, %4.3f\n",
+						_instance, latitude, longitude, static_cast<double>(altitude));
 				}
 			}
 		}
@@ -424,7 +427,7 @@ void EKF2::Run()
 		}
 
 	} else {
-		const unsigned last_generation = _vehicle_imu_sub.get_last_generation();
+		const unsigned last_generation = _sensor_combined_sub.get_last_generation();
 		sensor_combined_s sensor_combined;
 		imu_updated = _sensor_combined_sub.update(&sensor_combined);
 
@@ -446,6 +449,28 @@ void EKF2::Run()
 			}
 
 			imu_dt = sensor_combined.gyro_integral_dt;
+
+			if (sensor_combined.accel_calibration_count != _accel_calibration_count) {
+
+				PX4_DEBUG("%d - resetting accelerometer bias", _instance);
+
+				_ekf.resetAccelBias();
+				_accel_calibration_count = sensor_combined.accel_calibration_count;
+
+				// reset bias learning
+				_accel_cal = {};
+			}
+
+			if (sensor_combined.gyro_calibration_count != _gyro_calibration_count) {
+
+				PX4_DEBUG("%d - resetting rate gyro bias", _instance);
+
+				_ekf.resetGyroBias();
+				_gyro_calibration_count = sensor_combined.gyro_calibration_count;
+
+				// reset bias learning
+				_gyro_cal = {};
+			}
 		}
 
 		if (_sensor_selection_sub.updated() || (_device_id_accel == 0 || _device_id_gyro == 0)) {
@@ -591,6 +616,8 @@ void EKF2::Run()
 			UpdateMagCalibration(now);
 			PublishSensorBias(now);
 
+			PublishAidSourceStatus(now);
+
 		} else {
 			// ekf no update
 			perf_set_elapsed(_ecl_ekf_update_perf, hrt_elapsed_time(&ekf_update_start));
@@ -607,6 +634,23 @@ void EKF2::Run()
 
 	// re-schedule as backup timeout
 	ScheduleDelayed(100_ms);
+}
+
+void EKF2::PublishAidSourceStatus(const hrt_abstime &timestamp)
+{
+	// baro height
+	PublishAidSourceStatus(_ekf.aid_src_baro_hgt(), _status_baro_hgt_pub_last, _estimator_aid_src_baro_hgt_pub);
+
+	// RNG height
+	PublishAidSourceStatus(_ekf.aid_src_rng_hgt(), _status_rng_hgt_pub_last, _estimator_aid_src_rng_hgt_pub);
+
+	// fake position
+	PublishAidSourceStatus(_ekf.aid_src_fake_pos(), _status_fake_pos_pub_last, _estimator_aid_src_fake_pos_pub);
+
+	// GNSS velocity & position
+	PublishAidSourceStatus(_ekf.aid_src_gnss_vel(), _status_gnss_vel_pub_last, _estimator_aid_src_gnss_vel_pub);
+	PublishAidSourceStatus(_ekf.aid_src_gnss_pos(), _status_gnss_pos_pub_last, _estimator_aid_src_gnss_pos_pub);
+
 }
 
 void EKF2::PublishAttitude(const hrt_abstime &timestamp)
@@ -690,6 +734,10 @@ void EKF2::PublishEventFlags(const hrt_abstime &timestamp)
 		event_flags.starting_vision_vel_fusion          = _ekf.information_event_flags().starting_vision_vel_fusion;
 		event_flags.starting_vision_yaw_fusion          = _ekf.information_event_flags().starting_vision_yaw_fusion;
 		event_flags.yaw_aligned_to_imu_gps              = _ekf.information_event_flags().yaw_aligned_to_imu_gps;
+		event_flags.reset_hgt_to_baro                   = _ekf.information_event_flags().reset_hgt_to_baro;
+		event_flags.reset_hgt_to_gps                    = _ekf.information_event_flags().reset_hgt_to_gps;
+		event_flags.reset_hgt_to_rng                    = _ekf.information_event_flags().reset_hgt_to_rng;
+		event_flags.reset_hgt_to_ev                     = _ekf.information_event_flags().reset_hgt_to_ev;
 
 		event_flags.warning_event_changes               = _filter_warning_event_changes;
 		event_flags.gps_quality_poor                    = _ekf.warning_event_flags().gps_quality_poor;
@@ -816,6 +864,7 @@ void EKF2::PublishInnovations(const hrt_abstime &timestamp)
 	_ekf.getAirspeedInnov(innovations.airspeed);
 	_ekf.getBetaInnov(innovations.beta);
 	_ekf.getHaglInnov(innovations.hagl);
+	_ekf.getHaglRateInnov(innovations.hagl_rate);
 	// Not yet supported
 	innovations.aux_vvel = NAN;
 
@@ -829,6 +878,11 @@ void EKF2::PublishInnovations(const hrt_abstime &timestamp)
 		_preflt_checker.setUsingFlowAiding(_ekf.control_status_flags().opt_flow);
 		_preflt_checker.setUsingEvPosAiding(_ekf.control_status_flags().ev_pos);
 		_preflt_checker.setUsingEvVelAiding(_ekf.control_status_flags().ev_vel);
+
+		_preflt_checker.setUsingBaroHgtAiding(_ekf.control_status_flags().baro_hgt);
+		_preflt_checker.setUsingGpsHgtAiding(_ekf.control_status_flags().gps_hgt);
+		_preflt_checker.setUsingRngHgtAiding(_ekf.control_status_flags().rng_hgt);
+		_preflt_checker.setUsingEvHgtAiding(_ekf.control_status_flags().ev_hgt);
 
 		_preflt_checker.update(_ekf.get_imu_sample_delayed().delta_ang_dt, innovations);
 
@@ -856,6 +910,7 @@ void EKF2::PublishInnovationTestRatios(const hrt_abstime &timestamp)
 	_ekf.getAirspeedInnovRatio(test_ratios.airspeed);
 	_ekf.getBetaInnovRatio(test_ratios.beta);
 	_ekf.getHaglInnovRatio(test_ratios.hagl);
+	_ekf.getHaglRateInnovRatio(test_ratios.hagl_rate);
 	// Not yet supported
 	test_ratios.aux_vvel = NAN;
 
@@ -880,6 +935,7 @@ void EKF2::PublishInnovationVariances(const hrt_abstime &timestamp)
 	_ekf.getAirspeedInnovVar(variances.airspeed);
 	_ekf.getBetaInnovVar(variances.beta);
 	_ekf.getHaglInnovVar(variances.hagl);
+	_ekf.getHaglRateInnovVar(variances.hagl_rate);
 	// Not yet supported
 	variances.aux_vvel = NAN;
 
@@ -1127,7 +1183,7 @@ void EKF2::PublishSensorBias(const hrt_abstime &timestamp)
 			_last_gyro_bias_published = gyro_bias;
 		}
 
-		if ((_device_id_accel != 0) && !(_param_ekf2_aid_mask.get() & MASK_INHIBIT_ACC_BIAS)) {
+		if ((_device_id_accel != 0) && !(_param_ekf2_aid_mask.get() & SensorFusionMask::INHIBIT_ACC_BIAS)) {
 			bias.accel_device_id = _device_id_accel;
 			accel_bias.copyTo(bias.accel_bias);
 			bias.accel_bias_limit = _params->acc_bias_lim;
@@ -1279,6 +1335,7 @@ void EKF2::PublishStatusFlags(const hrt_abstime &timestamp)
 		status_flags.cs_rng_fault             = _ekf.control_status_flags().rng_fault;
 		status_flags.cs_inertial_dead_reckoning = _ekf.control_status_flags().inertial_dead_reckoning;
 		status_flags.cs_wind_dead_reckoning     = _ekf.control_status_flags().wind_dead_reckoning;
+		status_flags.cs_rng_kin_consistent      = _ekf.control_status_flags().rng_kin_consistent;
 
 		status_flags.fault_status_changes     = _filter_fault_status_changes;
 		status_flags.fs_bad_mag_x             = _ekf.fault_status_flags().bad_mag_x;
@@ -1334,6 +1391,7 @@ void EKF2::PublishYawEstimatorStatus(const hrt_abstime &timestamp)
 			       yaw_est_test_data.innov_vn, yaw_est_test_data.innov_ve,
 			       yaw_est_test_data.weight)) {
 
+		yaw_est_test_data.yaw_composite_valid = _ekf.isYawEmergencyEstimateAvailable();
 		yaw_est_test_data.timestamp_sample = _ekf.get_imu_sample_delayed().time_us;
 		yaw_est_test_data.timestamp = _replay_mode ? timestamp : hrt_absolute_time();
 
@@ -1368,14 +1426,18 @@ void EKF2::PublishWindEstimate(const hrt_abstime &timestamp)
 void EKF2::PublishOpticalFlowVel(const hrt_abstime &timestamp)
 {
 	if (_ekf.getFlowCompensated().longerThan(0.f)) {
-		estimator_optical_flow_vel_s flow_vel{};
+		vehicle_optical_flow_vel_s flow_vel{};
 		flow_vel.timestamp_sample = _ekf.get_imu_sample_delayed().time_us;
 
 		_ekf.getFlowVelBody().copyTo(flow_vel.vel_body);
 		_ekf.getFlowVelNE().copyTo(flow_vel.vel_ne);
+
 		_ekf.getFlowUncompensated().copyTo(flow_vel.flow_uncompensated_integral);
 		_ekf.getFlowCompensated().copyTo(flow_vel.flow_compensated_integral);
-		_ekf.getFlowGyro().copyTo(flow_vel.gyro_rate_integral);
+
+		_ekf.getFlowGyro().copyTo(flow_vel.gyro_rate);
+		_ekf.getFlowGyroIntegral().copyTo(flow_vel.gyro_rate_integral);
+
 		flow_vel.timestamp = _replay_mode ? timestamp : hrt_absolute_time();
 
 		_estimator_optical_flow_vel_pub.publish(flow_vel);
@@ -1456,7 +1518,7 @@ void EKF2::UpdateAirspeedSample(ekf2_timestamps_s &ekf2_timestamps)
 			    && (airspeed.indicated_airspeed_m_s > 0.f)
 			   ) {
 				airspeedSample airspeed_sample {
-					.time_us = airspeed.timestamp,
+					.time_us = airspeed.timestamp_sample,
 					.true_airspeed = true_airspeed_m_s,
 					.eas2tas = airspeed.true_airspeed_m_s / airspeed.indicated_airspeed_m_s,
 				};
@@ -1569,10 +1631,10 @@ bool EKF2::UpdateExtVisionSample(ekf2_timestamps_s &ekf2_timestamps, vehicle_odo
 			ev_data.vel(2) = ev_odom.vz;
 
 			if (ev_odom.velocity_frame == vehicle_odometry_s::BODY_FRAME_FRD) {
-				ev_data.vel_frame = velocity_frame_t::BODY_FRAME_FRD;
+				ev_data.vel_frame = VelocityFrame::BODY_FRAME_FRD;
 
 			} else {
-				ev_data.vel_frame = velocity_frame_t::LOCAL_FRAME_FRD;
+				ev_data.vel_frame = VelocityFrame::LOCAL_FRAME_FRD;
 			}
 
 			// velocity measurement error from ev_data or parameters
@@ -1653,29 +1715,29 @@ bool EKF2::UpdateFlowSample(ekf2_timestamps_s &ekf2_timestamps)
 {
 	// EKF flow sample
 	bool new_optical_flow = false;
-	const unsigned last_generation = _optical_flow_sub.get_last_generation();
-	optical_flow_s optical_flow;
+	const unsigned last_generation = _vehicle_optical_flow_sub.get_last_generation();
+	vehicle_optical_flow_s optical_flow;
 
-	if (_optical_flow_sub.update(&optical_flow)) {
+	if (_vehicle_optical_flow_sub.update(&optical_flow)) {
 		if (_msg_missed_optical_flow_perf == nullptr) {
 			_msg_missed_optical_flow_perf = perf_alloc(PC_COUNT, MODULE_NAME": optical_flow messages missed");
 
-		} else if (_optical_flow_sub.get_last_generation() != last_generation + 1) {
+		} else if (_vehicle_optical_flow_sub.get_last_generation() != last_generation + 1) {
 			perf_count(_msg_missed_optical_flow_perf);
 		}
 
 		flowSample flow {
-			.time_us = optical_flow.timestamp,
+			.time_us = optical_flow.timestamp_sample,
 			// NOTE: the EKF uses the reverse sign convention to the flow sensor. EKF assumes positive LOS rate
 			// is produced by a RH rotation of the image about the sensor axis.
-			.flow_xy_rad = Vector2f{-optical_flow.pixel_flow_x_integral, -optical_flow.pixel_flow_y_integral},
-			.gyro_xyz = Vector3f{-optical_flow.gyro_x_rate_integral, -optical_flow.gyro_y_rate_integral, -optical_flow.gyro_z_rate_integral},
-			.dt = 1e-6f * (float)optical_flow.integration_timespan,
+			.flow_xy_rad = Vector2f{-optical_flow.pixel_flow[0], -optical_flow.pixel_flow[1]},
+			.gyro_xyz = Vector3f{-optical_flow.delta_angle[0], -optical_flow.delta_angle[1], -optical_flow.delta_angle[2]},
+			.dt = 1e-6f * (float)optical_flow.integration_timespan_us,
 			.quality = optical_flow.quality,
 		};
 
-		if (PX4_ISFINITE(optical_flow.pixel_flow_y_integral) &&
-		    PX4_ISFINITE(optical_flow.pixel_flow_x_integral) &&
+		if (PX4_ISFINITE(optical_flow.pixel_flow[0]) &&
+		    PX4_ISFINITE(optical_flow.pixel_flow[1]) &&
 		    flow.dt < 1) {
 
 			// Save sensor limits reported by the optical flow sensor
@@ -1685,6 +1747,22 @@ bool EKF2::UpdateFlowSample(ekf2_timestamps_s &ekf2_timestamps)
 			_ekf.setOpticalFlowData(flow);
 
 			new_optical_flow = true;
+		}
+
+		// use optical_flow distance as range sample if distance_sensor unavailable
+		if (PX4_ISFINITE(optical_flow.distance_m) && (hrt_elapsed_time(&_last_range_sensor_update) > 1_s)) {
+
+			int8_t quality = static_cast<float>(optical_flow.quality) / static_cast<float>(UINT8_MAX) * 100.f;
+
+			rangeSample range_sample {
+				.time_us = optical_flow.timestamp_sample,
+				.rng = optical_flow.distance_m,
+				.quality = quality,
+			};
+			_ekf.setRangeData(range_sample);
+
+			// set sensor limits
+			_ekf.set_rangefinder_limits(optical_flow.min_ground_distance, optical_flow.max_ground_distance);
 		}
 
 		ekf2_timestamps.optical_flow_timestamp_rel = (int16_t)((int64_t)optical_flow.timestamp / 100 -
@@ -1708,7 +1786,7 @@ void EKF2::UpdateGpsSample(ekf2_timestamps_s &ekf2_timestamps)
 			perf_count(_msg_missed_gps_perf);
 		}
 
-		gps_message gps_msg{
+		gpsMessage gps_msg{
 			.time_usec = vehicle_gps_position.timestamp,
 			.lat = vehicle_gps_position.lat,
 			.lon = vehicle_gps_position.lon,
@@ -1760,14 +1838,14 @@ void EKF2::UpdateMagSample(ekf2_timestamps_s &ekf2_timestamps)
 
 			reset = true;
 
-		} else if (magnetometer.calibration_count > _mag_calibration_count) {
+		} else if (magnetometer.calibration_count != _mag_calibration_count) {
 			// existing calibration has changed, reset saved mag bias
 			PX4_DEBUG("%d - mag %" PRIu32 " calibration updated, resetting bias", _instance, _device_id_mag);
 			reset = true;
 		}
 
 		if (reset) {
-			_ekf.resetMagBias();
+			_ekf.resetMagBiasAndYaw();
 			_device_id_mag = magnetometer.device_id;
 			_mag_calibration_count = magnetometer.calibration_count;
 
@@ -1851,7 +1929,7 @@ void EKF2::UpdateRangeSample(ekf2_timestamps_s &ekf2_timestamps)
 
 void EKF2::UpdateAccelCalibration(const hrt_abstime &timestamp)
 {
-	if (_param_ekf2_aid_mask.get() & MASK_INHIBIT_ACC_BIAS) {
+	if (_param_ekf2_aid_mask.get() & SensorFusionMask::INHIBIT_ACC_BIAS) {
 		_accel_cal.cal_available = false;
 		return;
 	}
